@@ -1,0 +1,24 @@
+# The REAL demo container: install the PUBLISHED SDK from PyPI (`pip install paymos`) — no source,
+# no Rust, no build — and serve the clickable web demo (prod-pointed). This is what an integrator
+# would actually do. Build context is sdk/python (see Dockerfile.demo.dockerignore).
+#
+#   docker build -f sdk/python/Dockerfile.demo -t paymos-pip-demo sdk/python
+#   docker run --rm -p 8000:8000 paymos-pip-demo      # then open http://localhost:8000 and click
+#
+FROM python:3.11-slim
+WORKDIR /app
+
+# One line: pip pulls the platform wheel (manylinux on Linux) from PyPI. Pinned for reproducibility.
+# fastapi/uvicorn are the demo's own extras (not paymos deps).
+RUN pip install --no-cache-dir "paymos==0.1.2" fastapi uvicorn
+
+# Sanity: prove the PyPI-installed package imports + the native FROST core runs on this image.
+RUN python -c "import json; from paymos import Wallet, _core, __version__; \
+r=json.loads(_core.mpc_call(json.dumps({'op':'dkg_part1','id':1,'max':2,'min':2}))); \
+assert r.get('ok'), r; print('paymos', __version__, 'from PyPI — native _core ok on', __import__('platform').system())"
+
+# The demo app (backend + page). The SDK is already installed from PyPI above.
+COPY examples /app/examples
+EXPOSE 8000
+ENV PAYMOS_BASE_URL=https://wallet.paymos.io
+CMD ["uvicorn", "examples.app:app", "--host", "0.0.0.0", "--port", "8000"]

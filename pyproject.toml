@@ -1,0 +1,68 @@
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "paymos-wallet"
+version = "1.0.0"
+description = "Non-custodial, headless SDK to control a wallet vault: balances, fee-transparent quotes, swaps and on-chain withdrawals over a co-signed 2-of-2 vault."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]
+authors = [{ name = "Paymos" }]
+keywords = ["wallet", "vault", "crypto", "payments", "sdk", "non-custodial", "mpc", "withdrawals"]
+# NOTE: license — publishing to PUBLIC PyPI makes the WHOLE SDK readable: the wheel ships the Python
+# source with the Rust signing core compiled, and the published sdist ships the full Rust source of
+# that core (incl. its local path-dep crates). The sdist is kept on purpose — pip needs it to build on
+# platforms we don't ship wheels for. So the license, not compilation, is what restricts reuse:
+# "Proprietary" grants no reuse rights; change to "MIT" / "Apache-2.0" if you want integrators to adopt freely.
+license = { text = "Proprietary" }
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "License :: Other/Proprietary License",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Financial",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://wallet.paymos.io"
+
+# NOTE: no [project.scripts] — the vs_live_ vault secret is created in the wallet Mini App's
+# "Vault API" screen (on-device share decrypt), not a CLI provisioner. The SDK just consumes the
+# secret string. `cryptography` was only needed by that dropped provisioner, so it's not a runtime dep.
+
+[tool.maturin]
+manifest-path = "rust/paymos_core/Cargo.toml"
+# Mixed layout: python-source="." makes maturin ship the sibling pure-Python `paymos/`
+# package, and module-name="paymos._core" nests the native extension INSIDE it as
+# `paymos/_core`. Both `paymos` (pure) and `paymos._core` (native) go in one wheel.
+# Without python-source the wheel shipped ONLY the native module and `import paymos` broke
+# for real pip consumers.
+python-source = "."
+module-name = "paymos._core"
+# Keep the published sdist minimal. A `pip install` that finds no matching wheel (macOS,
+# Linux ARM, musl/Alpine) falls back to the sdist and BUILDS from it — so whatever ships
+# there is readable on that installer's machine. tests/docs/examples are dev-only, not
+# needed to build, and were never in the wheel — exclude them from the sdist too, so no
+# pip-install path ever ships them (this is where the golden-vector fixtures lived).
+exclude = [
+    { path = "tests/**/*", format = "sdist" },
+    { path = "docs/**/*", format = "sdist" },
+    { path = "examples/**/*", format = "sdist" },
+]
+
+[tool.pytest.ini_options]
+# The SDK is async-first (httpx.AsyncClient); auto mode runs every `async def test_*`
+# under pytest-asyncio without a per-test marker, so an async test can never silently
+# no-op (collected-but-never-awaited → trivially "passes"). `@pytest.mark.asyncio` still
+# works. pytest-asyncio is a dev/test dependency only (not in [project].dependencies).
+asyncio_mode = "auto"
+testpaths = ["tests"]

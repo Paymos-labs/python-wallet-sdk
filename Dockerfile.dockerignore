@@ -1,0 +1,34 @@
+# Docker build-context hygiene for the SDK demo image (sdk/python/Dockerfile).
+# The build only COPYs sdk/rust, mpc/wallet-mpc, and sdk/python/{pyproject.toml,README.md,paymos,examples};
+# everything below is heavy junk that must NOT be uploaded to the daemon (this is a monorepo — without
+# this the context is multiple GB of node_modules / Rust target / .NET bin+obj / venvs / .git).
+.git
+.superpowers/
+.claude/
+
+# JS / client
+**/node_modules/
+**/wwwroot/
+**/.svelte-kit/
+**/build/
+
+# Rust
+**/target/
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/dist/
+**/*.whl
+**/*.egg-info/
+
+# .NET
+**/bin/
+**/obj/
+
+# data / scratch
+*.sqlite3
+*.sqlite3.*
+**/*.log

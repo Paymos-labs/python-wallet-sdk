@@ -1,0 +1,21 @@
+# Local dev virtualenv used for `maturin develop` — never commit.
+.venv/
+
+# Build artifacts / caches
+build/
+dist/
+*.egg-info/
+target/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# maturin-built native extension (produced by `maturin develop`, not source).
+# The module is nested as `paymos._core`, so the artifact is `paymos/_core*.pyd|.so`;
+# keep the old `paymos_core*` globs too for any leftover top-level builds.
+paymos/_core*.pyd
+paymos/_core*.so
+paymos_core*.pyd
+paymos_core*.so
+# Debug symbols emitted alongside the .pyd on Windows (never source).
+*.pdb

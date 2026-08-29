@@ -1,0 +1,30 @@
+[package]
+# The PACKAGE is named for crates.io (path deps cannot be published, so the Rust SDK's core is a
+# published crate like any other dependency); the LIB keeps its old name, so `use wallet_mpc::…`,
+# the .NET `DllImport("wallet_mpc")` and the shipped `libwallet_mpc.so` artifact are all untouched.
+name = "paymos-wallet-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "2-of-2 FROST-ed25519 threshold signing core for the Paymos wallet (server FFI + client SDK bindings)."
+homepage = "https://wallet.paymos.io"
+license-file = "LICENSE"
+
+[lib]
+name = "wallet_mpc"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+frost-ed25519 = { version = "2", features = ["serde"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# WASM (client) only: the JS-facing surface + browser CSPRNG for OsRng.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+ed25519-dalek = "2"

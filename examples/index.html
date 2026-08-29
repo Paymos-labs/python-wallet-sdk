@@ -1,0 +1,498 @@
+<!--
+  Paymos SDK demo — self-contained clickable page (vanilla JS, no build step).
+  Served by examples/app.py at GET /. All fetches go to the same-origin /api/*;
+  the backend talks to prod. The secret you paste stays on this machine — it is
+  posted to your LOCAL backend only, never persisted or logged.
+-->
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Paymos SDK demo</title>
+<style>
+  :root {
+    --bg: #000000;
+    --panel: #0b0d10;
+    --panel-2: #121519;
+    --line: #1e242b;
+    --line-soft: #171b21;
+    --ink: #f4f6f8;
+    --ink-dim: #9aa4af;
+    --ink-faint: #6a7480;
+    --accent: #5eead4;
+    --accent-dim: #227d70;
+    --danger: #ef4444;
+    --danger-bg: #2a1113;
+    --danger-line: #5b1d20;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --radius: 14px;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); }
+  body {
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    padding: 32px 20px 96px;
+    max-width: 860px;
+    margin: 0 auto;
+  }
+  a { color: var(--accent); }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 2px; }
+  h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--ink-dim); margin: 0 0 12px;
+  }
+  .sub { color: var(--ink-faint); font-size: 13px; margin: 0 0 24px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin: 0 0 16px;
+  }
+  label { display: block; font-size: 12px; color: var(--ink-dim); margin: 0 0 6px; }
+  input, select {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--ink);
+    font: inherit;
+    font-size: 14px;
+    padding: 10px 12px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent-dim); }
+  input::placeholder { color: var(--ink-faint); }
+  input[type="checkbox"] { width: auto; accent-color: var(--danger); }
+  .mono { font-family: var(--mono); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > .col { flex: 1 1 140px; min-width: 0; }
+  .hint { font-size: 11px; color: var(--ink-faint); margin: 6px 0 0; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    font-size: 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 16px;
+    background: var(--panel-2);
+    color: var(--ink);
+    cursor: pointer;
+    transition: border-color .12s, opacity .12s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent-dim); }
+  button.primary { background: var(--accent); color: #04110e; border-color: var(--accent); }
+  button.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 16px; }
+  .toggle button {
+    border: 0; border-radius: 0; background: transparent; color: var(--ink-dim);
+    padding: 8px 18px; font-size: 13px;
+  }
+  .toggle button.on { background: var(--panel-2); color: var(--ink); }
+  .spacer { height: 12px; }
+  .divider { height: 1px; background: var(--line-soft); margin: 18px 0; }
+  .muted { color: var(--ink-dim); }
+  .kv { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; font-size: 13px; }
+  .kv .k { color: var(--ink-dim); }
+  .kv .v { font-family: var(--mono); text-align: right; word-break: break-all; }
+
+  /* Balances list */
+  .bal { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line-soft); }
+  .bal:first-child { border-top: 0; }
+  .bal .asset { font-weight: 600; font-size: 14px; }
+  .bal .chain { color: var(--ink-faint); font-size: 12px; margin-left: 6px; font-weight: 400; }
+  .bal .amt { font-family: var(--mono); font-size: 13px; text-align: right; }
+  .bal .usd { color: var(--ink-faint); font-size: 12px; }
+
+  /* Fee breakdown — the centerpiece */
+  .fees { background: linear-gradient(180deg, var(--panel-2), var(--panel)); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .fees .cap { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-dim); margin-bottom: 4px; }
+  .fees .unit { font-size: 12px; color: var(--ink-faint); margin-bottom: 14px; font-family: var(--mono); }
+  .fee-line { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline; gap: 10px 16px; padding: 8px 0; border-top: 1px solid var(--line-soft); }
+  .fee-line:first-of-type { border-top: 0; }
+  .fee-line .lbl { color: var(--ink-dim); font-size: 13px; }
+  .fee-line .raw { font-family: var(--mono); font-size: 14px; text-align: right; }
+  .fee-line .usd { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); text-align: right; min-width: 68px; }
+  .fee-line .tag { display: inline-block; font-size: 10px; color: var(--warn); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; margin-left: 8px; vertical-align: middle; }
+  .fee-total { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline; gap: 10px 16px; padding: 12px 0 2px; margin-top: 6px; border-top: 1px solid var(--line); }
+  .fee-total .lbl { font-weight: 600; font-size: 13px; }
+  .fee-total .raw { font-family: var(--mono); font-size: 16px; font-weight: 600; text-align: right; color: var(--accent); }
+  .fee-total .usd { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); text-align: right; min-width: 68px; }
+
+  .warn-banner {
+    background: var(--danger-bg); border: 1px solid var(--danger-line);
+    border-radius: 10px; padding: 12px 14px; font-size: 13px; color: #fecaca; margin-bottom: 14px;
+  }
+  .warn-banner b { color: #fff; }
+  .confirm-row { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 14px; font-size: 13px; color: var(--ink-dim); }
+  .confirm-row label { margin: 0; font-size: 13px; color: var(--ink-dim); }
+  .err { background: var(--danger-bg); border: 1px solid var(--danger-line); border-radius: 10px; padding: 12px 14px; font-size: 13px; color: #fecaca; }
+  .err .type { font-family: var(--mono); font-size: 11px; color: var(--warn); text-transform: none; margin-bottom: 3px; }
+  pre { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); white-space: pre-wrap; word-break: break-all; margin: 0; }
+  .status { font-size: 12px; color: var(--ink-faint); margin-top: 8px; min-height: 16px; }
+  .locknote { font-size: 11px; color: var(--ink-faint); display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; }
+  .hidden { display: none !important; }
+  .status-pill { display: inline-block; font-family: var(--mono); font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); }
+  .status-pill.completed { color: var(--ok); border-color: var(--accent-dim); }
+  .status-pill.failed, .status-pill.refunded, .status-pill.expired, .status-pill.cancelled { color: var(--danger); border-color: var(--danger-line); }
+</style>
+
+<h1>Paymos SDK demo</h1>
+<p class="sub">
+  A local page over <code class="mono">from paymos import Wallet</code>. Load balances, preview a
+  quote with the full fee breakdown, and — gated — do a real swap.
+</p>
+
+<!-- Connection -->
+<div class="card">
+  <h2>Connection</h2>
+  <label for="secret">Paste your vault secret (<span class="mono">vs_live_…</span>)</label>
+  <input id="secret" class="mono" type="password" autocomplete="off" spellcheck="false"
+         placeholder="vs_live_…" />
+  <p class="locknote"><span class="dot"></span> Stays on this machine — posted to your local backend only, never stored.</p>
+  <div class="spacer"></div>
+  <label for="baseurl">Server (backend targets this)</label>
+  <input id="baseurl" class="mono" type="text" value="https://wallet.paymos.io" readonly
+         title="Set PAYMOS_BASE_URL on the backend to change this" />
+  <p class="hint">Prod by default. A read-scope key is enough for balances + quotes.</p>
+</div>
+
+<!-- Balances -->
+<div class="card">
+  <h2>Balances</h2>
+  <button id="btn-balances" class="primary">Load balances</button>
+  <div id="balances-status" class="status"></div>
+  <div id="balances-out"></div>
+</div>
+
+<!-- Quote -->
+<div class="card">
+  <h2>Quote — fee breakdown preview</h2>
+  <div class="toggle" id="kind-toggle">
+    <button data-kind="withdraw" class="on">Withdraw</button>
+    <button data-kind="swap">Swap</button>
+  </div>
+
+  <!-- Withdraw fields -->
+  <div id="fields-withdraw">
+    <div class="row">
+      <div class="col">
+        <label for="w-asset">Asset</label>
+        <input id="w-asset" class="mono" value="USDC@base" placeholder="SYMBOL@chain" />
+      </div>
+      <div class="col">
+        <label for="w-amount">Amount</label>
+        <input id="w-amount" class="mono" value="1" placeholder="1.0" />
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <label for="w-to">Destination address</label>
+    <input id="w-to" class="mono" value="0x0000000000000000000000000000000000000000" placeholder="0x…" />
+  </div>
+
+  <!-- Swap fields -->
+  <div id="fields-swap" class="hidden">
+    <div class="row">
+      <div class="col">
+        <label for="s-send">Send</label>
+        <input id="s-send" class="mono" value="USDC@base" placeholder="SYMBOL@chain" />
+      </div>
+      <div class="col">
+        <label for="s-receive">Receive</label>
+        <input id="s-receive" class="mono" value="ETH@arb" placeholder="SYMBOL@chain" />
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="row">
+      <div class="col">
+        <label for="s-amount">Amount (in send)</label>
+        <input id="s-amount" class="mono" value="1" placeholder="1.0" />
+      </div>
+      <div class="col">
+        <label for="s-slippage">Slippage (bps)</label>
+        <input id="s-slippage" class="mono" value="50" placeholder="50" />
+      </div>
+    </div>
+  </div>
+
+  <div class="spacer"></div>
+  <button id="btn-quote" class="primary">Get quote</button>
+  <div id="quote-status" class="status"></div>
+  <div id="quote-out"></div>
+</div>
+
+<!-- Swap (real money) -->
+<div class="card">
+  <h2>Swap — real money</h2>
+  <div class="warn-banner">
+    <b>This moves real funds.</b> It uses the Swap fields above and requires a funded
+    <b>full</b> vault secret. A read-only key is rejected. Run this locally only.
+  </div>
+  <div class="confirm-row">
+    <input id="swap-confirm" type="checkbox" />
+    <label for="swap-confirm">I understand this executes a real on-chain swap and moves funds.</label>
+  </div>
+  <button id="btn-swap" class="danger" disabled>Swap (real money)</button>
+  <div id="swap-status" class="status"></div>
+  <div id="swap-out"></div>
+</div>
+
+<script>
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const secretEl = $("secret");
+
+  // Neutral, human labels for the fee legs — no rails vocabulary anywhere in the UI.
+  const FEE_LABELS = { platform: "Platform fee", network: "Network fee", route: "Route (spread)" };
+
+  function getSecret() {
+    const s = (secretEl.value || "").trim();
+    if (!s) throw new Error("Paste your vault secret (vs_live_…) above.");
+    return s;
+  }
+
+  async function callApi(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) { /* non-JSON */ }
+    if (!res.ok) {
+      const err = new Error((data && data.error) || ("HTTP " + res.status));
+      err.type = (data && data.type) || "HttpError";
+      err.retryAfter = data && data.retry_after;
+      throw err;
+    }
+    return data;
+  }
+
+  function renderError(el, e) {
+    const type = e.type ? `<div class="type">${escapeHtml(e.type)}</div>` : "";
+    const retry = e.retryAfter ? ` (retry after ${e.retryAfter}s)` : "";
+    el.innerHTML = `<div class="err">${type}${escapeHtml(e.message || String(e))}${retry}</div>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function setBusy(btn, statusEl, msg) {
+    btn.disabled = true;
+    statusEl.textContent = msg || "Working…";
+  }
+  function clearBusy(btn, statusEl) {
+    btn.disabled = false;
+    statusEl.textContent = "";
+  }
+
+  // --- Balances --------------------------------------------------------------
+
+  // decimals per asset, harvested from the last balances load, so the fee panel can
+  // optionally show a human value alongside the authoritative raw string.
+  let DECIMALS = {};
+
+  function fmtRaw(raw, decimals) {
+    // Purely cosmetic scaling for display; the raw string is always shown too. Uses
+    // BigInt so we never coerce a money amount through a float.
+    try {
+      if (decimals == null) return null;
+      const neg = String(raw).startsWith("-");
+      let digits = String(raw).replace("-", "").padStart(decimals + 1, "0");
+      const cut = digits.length - decimals;
+      let whole = digits.slice(0, cut);
+      let frac = digits.slice(cut).replace(/0+$/, "");
+      const s = frac ? `${whole}.${frac}` : whole;
+      return neg ? `-${s}` : s;
+    } catch (_) { return null; }
+  }
+
+  $("btn-balances").addEventListener("click", async () => {
+    const out = $("balances-out"), status = $("balances-status");
+    out.innerHTML = "";
+    let secret;
+    try { secret = getSecret(); } catch (e) { renderError(out, e); return; }
+    setBusy($("btn-balances"), status, "Loading balances…");
+    try {
+      const list = await callApi("/api/balances", { secret });
+      DECIMALS = {};
+      for (const b of list) DECIMALS[b.asset] = b.decimals;
+      if (!list.length) {
+        out.innerHTML = `<p class="muted">No balances in this vault yet.</p>`;
+      } else {
+        out.innerHTML = list.map((b) => {
+          const human = fmtRaw(b.amount_raw, b.decimals);
+          const usd = b.usd != null ? `<div class="usd">$${escapeHtml(b.usd)}</div>` : "";
+          return `<div class="bal">
+            <div><span class="asset">${escapeHtml(b.symbol)}</span><span class="chain">${escapeHtml(b.asset)}</span></div>
+            <div>
+              <div class="amt">${human != null ? escapeHtml(human) : escapeHtml(b.amount_raw)}</div>
+              <div class="usd mono">${escapeHtml(b.amount_raw)} raw</div>
+              ${usd}
+            </div>
+          </div>`;
+        }).join("");
+      }
+    } catch (e) {
+      renderError(out, e);
+    } finally {
+      clearBusy($("btn-balances"), status);
+    }
+  });
+
+  // --- Quote kind toggle -----------------------------------------------------
+
+  let quoteKind = "withdraw";
+  document.querySelectorAll("#kind-toggle button").forEach((b) => {
+    b.addEventListener("click", () => {
+      quoteKind = b.dataset.kind;
+      document.querySelectorAll("#kind-toggle button").forEach((x) => x.classList.toggle("on", x === b));
+      $("fields-withdraw").classList.toggle("hidden", quoteKind !== "withdraw");
+      $("fields-swap").classList.toggle("hidden", quoteKind !== "swap");
+    });
+  });
+
+  // --- Fee breakdown panel (the centerpiece) ---------------------------------
+
+  function usdCell(usd, key) {
+    if (!usd || usd[key] == null) return `<div class="usd">—</div>`;
+    return `<div class="usd">~$${escapeHtml(usd[key])}</div>`;
+  }
+
+  function feeLine(labelKey, rawValue, usd, extraTag) {
+    const raw = rawValue == null ? "—" : escapeHtml(rawValue);
+    const tag = extraTag ? `<span class="tag">${escapeHtml(extraTag)}</span>` : "";
+    return `<div class="fee-line">
+      <div class="lbl">${FEE_LABELS[labelKey]}${tag}</div>
+      <div class="raw">${raw}</div>
+      ${usdCell(usd, labelKey)}
+    </div>`;
+  }
+
+  function renderFees(fees, decimals) {
+    const routeRaw = fees.route ? fees.route.amount : null;
+    const routeTag = fees.route ? (fees.route.estimate ? "estimate" : "exact") : null;
+    const humanTotal = fmtRaw(fees.total, decimals);
+    return `<div class="fees">
+      <div class="cap">Fee breakdown</div>
+      <div class="unit">in ${escapeHtml(fees.asset)} · amounts are raw smallest-unit strings</div>
+      ${feeLine("platform", fees.platform, fees.usd)}
+      ${feeLine("network", fees.network, fees.usd)}
+      ${feeLine("route", routeRaw, fees.usd, routeTag)}
+      <div class="fee-total">
+        <div class="lbl">Total fees${humanTotal != null ? ` <span class="muted mono">≈ ${escapeHtml(humanTotal)} ${escapeHtml((fees.asset||"").split("@")[0])}</span>` : ""}</div>
+        <div class="raw">${escapeHtml(fees.total)}</div>
+        ${usdCell(fees.usd, "total")}
+      </div>
+    </div>`;
+  }
+
+  function renderQuote(q) {
+    const decimals = DECIMALS[q.fees.asset];
+    const leg = (a, label) => {
+      const human = fmtRaw(a.amount, DECIMALS[a.asset]);
+      const h = human != null ? ` (${escapeHtml(human)})` : "";
+      return `<div class="kv"><span class="k">${label}</span><span class="v">${escapeHtml(a.amount)}${h} <span class="muted">${escapeHtml(a.asset)}</span></span></div>`;
+    };
+    const recv = `<div class="kv"><span class="k">Receive (expected)</span><span class="v">${escapeHtml(q.receive.amount)} <span class="muted">${escapeHtml(q.receive.asset)}</span></span></div>`
+      + `<div class="kv"><span class="k">Receive (guaranteed min)</span><span class="v">${escapeHtml(q.receive.min)} <span class="muted">${escapeHtml(q.receive.asset)}</span></span></div>`;
+    return `
+      ${renderFees(q.fees, decimals)}
+      <div class="divider"></div>
+      <div class="card" style="margin:0;background:var(--panel-2);">
+        <div class="kv"><span class="k">Mode</span><span class="v">${escapeHtml(q.mode)}</span></div>
+        ${leg(q.send, "Send")}
+        ${leg(q.debit, "Debit (send + fees)")}
+        ${recv}
+        <div class="kv"><span class="k">Expires</span><span class="v">${escapeHtml(q.expires_at)}</span></div>
+      </div>`;
+  }
+
+  $("btn-quote").addEventListener("click", async () => {
+    const out = $("quote-out"), status = $("quote-status");
+    out.innerHTML = "";
+    let secret;
+    try { secret = getSecret(); } catch (e) { renderError(out, e); return; }
+
+    let body = { secret, kind: quoteKind };
+    if (quoteKind === "withdraw") {
+      body.asset = $("w-asset").value.trim();
+      body.amount = $("w-amount").value.trim();
+      body.to = $("w-to").value.trim();
+    } else {
+      body.send = $("s-send").value.trim();
+      body.receive = $("s-receive").value.trim();
+      body.amount = $("s-amount").value.trim();
+      body.slippage_bps = parseInt($("s-slippage").value.trim() || "50", 10);
+    }
+
+    setBusy($("btn-quote"), status, "Pricing (dry preview — no money moves)…");
+    try {
+      const q = await callApi("/api/quote", body);
+      out.innerHTML = renderQuote(q);
+    } catch (e) {
+      renderError(out, e);
+    } finally {
+      clearBusy($("btn-quote"), status);
+    }
+  });
+
+  // --- Swap (real money) -----------------------------------------------------
+
+  $("swap-confirm").addEventListener("change", (e) => {
+    $("btn-swap").disabled = !e.target.checked;
+  });
+
+  function renderMovement(m) {
+    const cls = ["completed", "failed", "refunded", "expired", "cancelled"].includes(m.status) ? m.status : "";
+    const txt = m.dest_chain_tx_hash
+      ? (m.dest_chain_explorer_url
+          ? `<a href="${escapeHtml(m.dest_chain_explorer_url)}" target="_blank" rel="noopener">${escapeHtml(m.dest_chain_tx_hash)}</a>`
+          : escapeHtml(m.dest_chain_tx_hash))
+      : "—";
+    return `<div class="card" style="margin:0;background:var(--panel-2);">
+      <div class="kv"><span class="k">Status</span><span class="v"><span class="status-pill ${cls}">${escapeHtml(m.status)}</span></span></div>
+      <div class="kv"><span class="k">Movement id</span><span class="v">${escapeHtml(m.id)}</span></div>
+      <div class="kv"><span class="k">Type</span><span class="v">${escapeHtml(m.type)}</span></div>
+      <div class="kv"><span class="k">Send</span><span class="v">${escapeHtml(m.send.amount)} <span class="muted">${escapeHtml(m.send.asset)}</span></span></div>
+      <div class="kv"><span class="k">Receive</span><span class="v">${escapeHtml(m.receive.amount)} <span class="muted">${escapeHtml(m.receive.asset)}</span></span></div>
+      <div class="kv"><span class="k">Settlement tx</span><span class="v">${txt}</span></div>
+    </div>`;
+  }
+
+  $("btn-swap").addEventListener("click", async () => {
+    const out = $("swap-out"), status = $("swap-status");
+    out.innerHTML = "";
+    if (!$("swap-confirm").checked) return;
+    let secret;
+    try { secret = getSecret(); } catch (e) { renderError(out, e); return; }
+
+    const body = {
+      secret,
+      send: $("s-send").value.trim(),
+      receive: $("s-receive").value.trim(),
+      amount: $("s-amount").value.trim(),
+      slippage_bps: parseInt($("s-slippage").value.trim() || "50", 10),
+      confirm: true,
+    };
+    setBusy($("btn-swap"), status, "Submitting real swap and co-signing…");
+    try {
+      const m = await callApi("/api/swap", body);
+      out.innerHTML = renderMovement(m);
+    } catch (e) {
+      renderError(out, e);
+    } finally {
+      // Keep the button gated behind the checkbox after a run.
+      $("btn-swap").disabled = !$("swap-confirm").checked;
+      status.textContent = "";
+    }
+  });
+</script>

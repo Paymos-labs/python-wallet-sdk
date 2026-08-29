@@ -1,0 +1,22 @@
+[package]
+name = "paymos_core"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 Python extension wrapping the wallet-mpc 2-of-2 FROST-ed25519 engine."
+
+# Standalone: this crate is not part of any ancestor Cargo workspace. The empty [workspace]
+# table roots it here so `cargo build` in this dir never gets absorbed into a parent workspace.
+[workspace]
+
+[lib]
+name = "paymos_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py311: build against CPython's stable ABI (>= 3.11), so ONE wheel per platform
+# (tagged cp311-abi3) serves 3.11 / 3.12 / 3.13+ instead of a separate wheel per minor.
+# abi3 is ABI-only and changes nothing at runtime — the full pytest suite stays green.
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+# Published as `paymos-wallet-core` on crates.io; the lib name stays `wallet_mpc`, so the Rust
+# path below (`wallet_mpc::mpc_call_json`) is unchanged.
+paymos-wallet-core = { path = "../wallet-mpc" }
