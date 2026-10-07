@@ -23,6 +23,7 @@ Three layers:
    raises ``SlippageExceeded`` and never POSTs ``sign/begin``.
 """
 
+import hashlib
 import json
 
 import httpx
@@ -82,11 +83,12 @@ _VK = _CLIENT_KP["verifying_key"]
 _RECIPIENT = "vault.example"
 
 
-def _transfer_message(amount_raw, signer_id=_VK):
+def _transfer_message(amount_raw, signer_id=_VK, token="usdc-base"):
     # A minimal single "transfer" intent the SDK's disclosure guard accepts (shape + signer_id + one
-    # token). Built by hand so the exact utf-8 bytes are what the digest is taken over.
+    # token whose id hashes to USDC@base's catalog fingerprint). Built by hand so the exact utf-8
+    # bytes are what the digest is taken over.
     return ('{"deadline":"2026-07-07T00:00:00.000Z","intents":[{"intent":"transfer",'
-            '"receiver_id":"acct.example","tokens":{"tok:usdc":"' + str(amount_raw) + '"}}],'
+            '"receiver_id":"acct.example","tokens":{"' + token + '":"' + str(amount_raw) + '"}}],'
             '"signer_id":"' + signer_id + '"}')
 
 
@@ -179,11 +181,16 @@ def _movement(mid, status="completed", typ="swap"):
     }
 
 
+def _fp(token_id: str) -> str:
+    """An asset fingerprint as the server publishes it: lowercase hex sha256 of the raw token id."""
+    return hashlib.sha256(token_id.encode("utf-8")).hexdigest()
+
+
 ASSETS = [
     {"asset": "USDC@base", "symbol": "USDC", "chain": "base", "decimals": 6,
-     "min_deposit_raw": None, "min_withdraw_raw": None},
+     "min_deposit_raw": None, "min_withdraw_raw": None, "fingerprint": _fp("usdc-base")},
     {"asset": "ETH@arb", "symbol": "ETH", "chain": "arb", "decimals": 18,
-     "min_deposit_raw": None, "min_withdraw_raw": None},
+     "min_deposit_raw": None, "min_withdraw_raw": None, "fingerprint": _fp("eth-arb")},
 ]
 
 
@@ -513,6 +520,237 @@ async def test_refuses_when_sources_move_more_than_the_approved_debit():
         def _message_for(self, i, amount):
             return _transfer_message(int(self.quote["debit"]["amount"]) * 1000)   # far above the debit
     await _expect_refusal(_Inflated(_swap_quote(movement_id="mv_g", sources=1), movement_id="mv_g"))
+
+
+# A disclosed per-source amount is a raw, positive, ASCII-digit string — nothing ``int()`` merely
+# tolerates. Refused BEFORE a single share is computed: the spy counts calls into ``_frost.sign``.
+
+@pytest.fixture
+def sign_spy(monkeypatch):
+    import paymos._frost as frost_mod
+    calls = []
+    real = frost_mod.sign
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(frost_mod, "sign", spy)
+    return calls
+
+
+async def _expect_amount_refusal(server, sign_spy):
+    w = server.wallet(_full_secret())
+    with pytest.raises(PaymosError, match="co-sign refused: source .* transfer amount"):
+        await w.swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == []                       # no share computed for ANY source
+    assert server.aggregate_calls == 0
+
+
+@pytest.mark.parametrize("bad", ["-900", "+5", " 5", "5 ", "", "0", "00", "1_000", "\u0665", "5\n", "0x10"])
+async def test_refuses_a_malformed_source_amount(bad, sign_spy):
+    class _BadAmount(_Server):
+        def _message_for(self, i, amount):
+            return _transfer_message(json.dumps(bad)[1:-1])  # JSON-escaped: decodes back to `bad`
+    await _expect_amount_refusal(_BadAmount(_swap_quote(movement_id="mv_g", sources=1), movement_id="mv_g"), sign_spy)
+
+
+async def test_refuses_a_json_number_amount(sign_spy):
+    # The server sends amounts as strings; a bare JSON number is not one.
+    class _NumberAmount(_Server):
+        def _message_for(self, i, amount):
+            return _transfer_message(amount).replace(f'"{amount}"', str(amount))
+    await _expect_amount_refusal(_NumberAmount(_swap_quote(movement_id="mv_g", sources=1), movement_id="mv_g"), sign_spy)
+
+
+async def test_refuses_a_negative_source_that_hides_an_inflated_one(sign_spy):
+    # Source A moves 2D, source B "moves" -D: the sum is D and would pass the debit check, while A
+    # alone takes twice the approved debit. The negative leg must sink the whole co-sign.
+    class _Offsetting(_Server):
+        def _message_for(self, i, amount):
+            debit = int(self.quote["debit"]["amount"])
+            return _transfer_message(2 * debit if i == 0 else -debit)
+    await _expect_amount_refusal(_Offsetting(_swap_quote(movement_id="mv_g", sources=2), movement_id="mv_g"), sign_spy)
+
+
+async def test_refuses_when_the_key_package_has_no_verifying_key(sign_spy):
+    # With nothing to hold signer_id against, the guard used to skip its "not from another vault"
+    # check. Today the core refuses such a package at commit time, before the guard runs; the guard's
+    # own refusal is the second line. Either way: a typed error, and nothing signed.
+    kp = {k: v for k, v in json.loads(_CLIENT_KP_JSON).items() if k != "verifying_key"}
+    srv = _Server(_swap_quote(movement_id="mv_vk", sources=1), movement_id="mv_vk")
+    w = srv.wallet(VaultSecret.pack("vk_live_test", 1, json.dumps(kp)))
+    with pytest.raises(PaymosError, match="verifying.key"):
+        await w.swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+# The token each source moves must be the approved SEND asset: its id hashes to that asset's catalog
+# fingerprint. Otherwise a debit approved in USDC could sign away the same count of something dearer.
+
+async def test_refuses_a_source_moving_another_catalog_asset(sign_spy):
+    class _OtherToken(_Server):
+        def _message_for(self, i, amount):
+            return _transfer_message(amount, token="eth-arb")   # ETH@arb's fingerprint, not USDC@base's
+    srv = _OtherToken(_swap_quote(movement_id="mv_g", sources=1), movement_id="mv_g")
+    with pytest.raises(PaymosError, match="not the approved send asset USDC@base"):
+        await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+async def test_refuses_one_bad_token_among_several_sources(sign_spy):
+    class _SecondSourceSwapped(_Server):
+        def _message_for(self, i, amount):
+            return _transfer_message(amount, token="usdc-base" if i == 0 else "usdc-base-evil")
+    srv = _SecondSourceSwapped(_swap_quote(movement_id="mv_g", sources=2), movement_id="mv_g")
+    with pytest.raises(PaymosError, match="source 1 moves a token"):
+        await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+async def test_refuses_when_the_server_publishes_no_fingerprint(sign_spy):
+    # An older server: reads keep working, but there is nothing to hold the token against — refuse,
+    # never skip the check.
+    class _NoFingerprint(_Server):
+        def handler(self, req):
+            if req.url.path == "/vault/v1/assets":
+                return httpx.Response(200, json=[{k: v for k, v in a.items() if k != "fingerprint"} for a in ASSETS])
+            return super().handler(req)
+    srv = _NoFingerprint(_swap_quote(movement_id="mv_g", sources=1), movement_id="mv_g")
+    w = srv.wallet(_full_secret())
+    assert (await w.assets())[0].fingerprint is None
+    with pytest.raises(PaymosError, match="did not publish an asset fingerprint"):
+        await w.swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+class _CatalogServer(_Server):
+    """A _Server whose /assets answers ``catalog``; each source moves ``token``."""
+
+    def __init__(self, *a, catalog, token="usdc-base", **k):
+        super().__init__(*a, **k)
+        self.catalog = catalog
+        self.token = token
+
+    def handler(self, req):
+        if req.url.path == "/vault/v1/assets":
+            return httpx.Response(200, json=self.catalog)
+        return super().handler(req)
+
+    def _message_for(self, i, amount):
+        return _transfer_message(amount, token=self.token)
+
+
+def _usdc_catalog(*fingerprints):
+    """ASSETS with USDC@base listed once per fingerprint (the same label, several contracts)."""
+    usdc, eth = ASSETS
+    return [{**usdc, "fingerprint": fp} for fp in fingerprints] + [eth]
+
+
+@pytest.mark.parametrize("token", ["usdc-base", "usdc-base-v2"])
+async def test_one_label_listed_twice_accepts_either_fingerprint(token):
+    # /assets may list one label twice with different fingerprints; one label is one coin, so a token
+    # matching ANY of them is the approved asset. The co-sign completes (aggregate verified for real).
+    srv = _CatalogServer(_swap_quote(movement_id="mv_d", sources=2), "mv_d",
+                         catalog=_usdc_catalog(_fp("usdc-base"), _fp("usdc-base-v2")), token=token)
+    mv = await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_d" and srv.aggregate_calls == 1
+
+
+async def test_one_label_listed_twice_still_refuses_a_third_token(sign_spy):
+    srv = _CatalogServer(_swap_quote(movement_id="mv_d", sources=1), "mv_d",
+                         catalog=_usdc_catalog(_fp("usdc-base"), _fp("usdc-base-v2")), token="usdc-other")
+    with pytest.raises(PaymosError, match="not the approved send asset"):
+        await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+# pinned_fingerprints: a pinned label is checked ONLY against its pins, whatever /assets publishes.
+
+def _pinned_wallet(srv, pins):
+    w = Wallet(_full_secret(), base_url="https://api.test", pinned_fingerprints=pins)
+    w._http._client = httpx.AsyncClient(base_url="https://api.test", transport=httpx.MockTransport(srv.handler))
+    return w
+
+
+async def test_pinned_fingerprint_signs_even_when_the_server_publishes_another():
+    # The server's catalog is wrong (or absent) for USDC@base; the out-of-band pin is what counts.
+    srv = _CatalogServer(_swap_quote(movement_id="mv_p", sources=1), "mv_p",
+                         catalog=_usdc_catalog(_fp("something-else")))
+    mv = await _pinned_wallet(srv, {"USDC@base": _fp("usdc-base").upper()}).swap(
+        send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_p" and srv.aggregate_calls == 1
+
+
+async def test_pinned_label_refuses_the_published_fingerprint_it_does_not_pin(sign_spy):
+    # The server publishes the token's true hash, but the integrator pinned a different value: the
+    # pin wins, so the server-backed match does not count.
+    srv = _CatalogServer(_swap_quote(movement_id="mv_p", sources=1), "mv_p",
+                         catalog=_usdc_catalog(_fp("usdc-base")))
+    w = _pinned_wallet(srv, {"USDC@base": [_fp("usdc-base-pinned"), _fp("usdc-base-pinned-2")]})
+    with pytest.raises(PaymosError, match="not the approved send asset"):
+        await w.swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+async def test_pin_on_another_label_leaves_the_send_label_on_the_catalog():
+    srv = _CatalogServer(_swap_quote(movement_id="mv_p", sources=1), "mv_p", catalog=_usdc_catalog(_fp("usdc-base")))
+    mv = await _pinned_wallet(srv, {"ETH@arb": _fp("not-eth")}).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_p"
+
+
+@pytest.mark.parametrize("bad", [{"USDC@base": ""}, {"USDC@base": []}, {"USDC@base": "abc"},
+                                 {"USDC@base": ["a42c7e46" * 8, "not-hex"]}, {"USDC@base": None},
+                                 {"USDC@base": 42}, {"USDC@base": ["a42c7e46" * 8, None]}])
+def test_malformed_pins_fail_at_construction(bad):
+    # The SDK's typed error, like every other configuration fault — not a bare ValueError/TypeError.
+    with pytest.raises(PaymosError, match="pinned_fingerprints") as exc:
+        Wallet(_full_secret(), base_url="https://api.test", pinned_fingerprints=bad)
+    assert type(exc.value) is PaymosError
+
+
+# A label listed twice with DIFFERENT decimals: the debit is in the first entry's units, so only
+# entries with the first entry's decimals may supply a fingerprint. Pins are exempt (vouched for).
+
+def _usdc_catalog_decimals(*entries):
+    """ASSETS with USDC@base listed once per (fingerprint, decimals)."""
+    usdc, eth = ASSETS
+    return [{**usdc, "fingerprint": fp, "decimals": d} for fp, d in entries] + [eth]
+
+
+async def test_label_listed_twice_refuses_the_entry_with_other_decimals(sign_spy):
+    srv = _CatalogServer(_swap_quote(movement_id="mv_x", sources=1), "mv_x",
+                         catalog=_usdc_catalog_decimals((_fp("usdc-base"), 6), (_fp("usdc-base-18"), 18)),
+                         token="usdc-base-18")
+    with pytest.raises(PaymosError, match="not the approved send asset"):
+        await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert sign_spy == [] and srv.aggregate_calls == 0
+
+
+async def test_label_listed_twice_still_signs_the_first_entrys_token_despite_other_decimals():
+    srv = _CatalogServer(_swap_quote(movement_id="mv_x", sources=1), "mv_x",
+                         catalog=_usdc_catalog_decimals((_fp("usdc-base"), 6), (_fp("usdc-base-18"), 18)))
+    mv = await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_x" and srv.aggregate_calls == 1
+
+
+@pytest.mark.parametrize("token", ["usdc-base", "usdc-base-v2"])
+async def test_label_listed_twice_with_equal_decimals_signs_either_token(token):
+    srv = _CatalogServer(_swap_quote(movement_id="mv_x", sources=1), "mv_x",
+                         catalog=_usdc_catalog_decimals((_fp("usdc-base"), 6), (_fp("usdc-base-v2"), 6)),
+                         token=token)
+    mv = await srv.wallet(_full_secret()).swap(send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_x" and srv.aggregate_calls == 1
+
+
+async def test_a_pin_is_not_filtered_by_decimals():
+    # The integrator pinned the second entry's fingerprint: pins are taken as given.
+    srv = _CatalogServer(_swap_quote(movement_id="mv_x", sources=1), "mv_x",
+                         catalog=_usdc_catalog_decimals((_fp("usdc-base"), 6), (_fp("usdc-base-18"), 18)),
+                         token="usdc-base-18")
+    mv = await _pinned_wallet(srv, {"USDC@base": _fp("usdc-base-18")}).swap(
+        send="USDC@base", receive="ETH@arb", amount="5")
+    assert mv.id == "mv_x"
 
 
 # =============================================================================

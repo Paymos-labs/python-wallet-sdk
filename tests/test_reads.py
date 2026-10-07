@@ -199,6 +199,7 @@ async def test_quote_swap_sends_slippage_and_converts_send_amount():
     # and the server scales it to raw using the asset's decimals.
     assert body["amount"] == "5"
     assert body["slippage_bps"] == 125
+    assert body["mode"] == "exact_in"  # explicit, as the recorded request carries it
     assert body["dry"] is True
 
     assert isinstance(q, Quote)

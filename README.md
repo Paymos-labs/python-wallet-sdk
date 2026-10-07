@@ -122,8 +122,9 @@ print(q.receive.min)     # guaranteed out (your slippage floor)
 
 `swap` and `withdraw` (full key only) create a **real** movement and drive the 2-of-2 co-sign,
 then return a `Movement`. Before any signature the SDK re-checks that the server's quote echoes
-**exactly** the assets and amount you approved — a decimals bug, contract drift, or a lying server
-raises and **signs nothing**.
+**exactly** the assets and amount you approved — a decimals bug, contract drift, or a quote that
+disagrees with your request raises and **signs nothing**. The destination is not part of that
+check (see [Security](#security)).
 
 ```python
 # Swap, delivered back to your own vault.
@@ -178,8 +179,8 @@ All `Wallet` methods are `async`.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `Wallet(secret, base_url=…, *, timeout=None)` | `Wallet` | `secret` is a `vs_live_…` string |
-| `Wallet.from_env(base_url=None, *, timeout=None)` | `Wallet` | reads `PAYMOS_VAULT_SECRET` / `PAYMOS_BASE_URL` |
+| `Wallet(secret, base_url=…, *, timeout=None, pinned_fingerprints=None)` | `Wallet` | `secret` is a `vs_live_…` string; `pinned_fingerprints` maps a label to its fingerprint(s) |
+| `Wallet.from_env(base_url=None, *, timeout=None, pinned_fingerprints=None)` | `Wallet` | reads `PAYMOS_VAULT_SECRET` / `PAYMOS_BASE_URL` |
 | `assets()` | `list[Asset]` | curated catalog, cached |
 | `balances()` | `list[Balance]` | per-asset vault balances |
 | `quote_swap(send, receive, amount, slippage_bps=50)` | `Quote` | dry preview |
@@ -198,7 +199,9 @@ override it with `Wallet(..., timeout=…)`.
 
 Every amount field is a **raw integer string**. All models are frozen dataclasses.
 
-- **`Asset`** — `asset`, `symbol`, `chain`, `decimals: int`
+- **`Asset`** — `asset`, `symbol`, `chain`, `decimals: int`, `fingerprint: str | None` (sha256 of the
+  asset's token id; the co-sign checks every transfer against it unless the label is pinned, and
+  refuses if neither a pin nor a published fingerprint exists)
 - **`Balance`** — `asset`, `symbol`, `chain`, `decimals: int`, `amount_raw`, `usd: str | None`
 - **`Amount`** — `amount`, `asset`
 - **`Receive`** — `amount`, `min` *(guaranteed)*, `asset`
@@ -255,9 +258,12 @@ created — a read key can never sign.
 
 - A leaked **API key alone cannot move funds** — no share, no signature (and the key can be revoked).
 - A leaked **share alone cannot move funds** — no server co-sign.
-- Both are required, on purpose. The SDK additionally verifies every message it co-signs, and that
-  the server's quote matches exactly what you approved — so a compromised server can't redirect
-  funds or inflate an amount past your caps.
+- Both are required, on purpose. The SDK additionally checks every message before it co-signs:
+  that it moves from your vault, moves the send asset (by the fingerprint the server publishes, or
+  the one you pinned), and moves no more than the approved debit.
+- What that does **not** cover: the transfer's recipient — the route's deposit address — is chosen
+  by the server and is not checked. And for `exact_out` the approved debit is itself computed by the
+  server; only `max_debit` puts your own ceiling on it. Pass `max_debit` on unattended payouts.
 
 Treat a full `vs_live_…` secret like a private key, and back up the share — losing it means losing
 your ability to co-sign.
@@ -302,8 +308,17 @@ your half of the signature exists.
 
 No, and this is the part worth reading twice. The server discloses the exact message it wants
 signed; the SDK recomputes the digest itself and refuses unless that message belongs to your vault,
-moves no more than the debit you approved, and matches the request you made. A server asking for
-anything else gets a refusal, not a signature.
+moves the asset and no more than the debit of the quote you approved. A server asking for more gets
+a refusal, not a signature. Two things it does not check: where the transfer goes (the route's
+deposit address is the server's choice), and — for `exact_out` without `max_debit` — how large the
+approved debit is, since the server computes it.
+
+The asset check works by fingerprint: the id of the token each transfer moves must hash to the
+fingerprint of the asset you are sending. By default that fingerprint comes from `GET /assets` — the same server that builds the
+message — so the check catches a server bug or a tampered signing path, not a server that lies about
+both. For a trust anchor the server does not control, pin the fingerprints you verified out of band:
+`Wallet(secret, pinned_fingerprints={"USDC@base": "a42c7e…"})`. A pinned label is checked only
+against its pins (a string or a list), whatever `/assets` says; unpinned labels use the catalog.
 
 ### Which networks and assets are supported?
 

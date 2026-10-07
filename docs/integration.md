@@ -518,8 +518,8 @@ async def swap(user_id: str, request: Request) -> JSONResponse:
 Notes carried over from the shipped example:
 
 - **One `Wallet` per request**, always closed in a `finally`.
-- **Malformed amounts / non-int slippage** raise `ValueError` from the SDK — catch and
-  map to a 400 if the values come from client input.
+- **Malformed amounts** raise `PaymosError` from the SDK — catch and map to a 400 if the
+  values come from client input.
 - **Never** put the secret in a response, a log line, or an error body.
 
 ---

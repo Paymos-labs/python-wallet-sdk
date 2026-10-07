@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A response that is not JSON (a proxy's HTML page, an empty 2xx) raises `PaymosError` naming the
+  status and content type, instead of a raw `JSONDecodeError` or a whole HTML page as the message.
+- `/assets` / `/balances` that do not answer a JSON array raise `PaymosError` instead of misreading.
+- Blind-sign guard: every per-source amount must be a positive ASCII-digit string. `int()` accepted
+  `"-900"`, so a negative source could offset an inflated one and pass the debit check.
+- Blind-sign guard: a malformed disclosure nonce, a `sign/begin` reply without `token`, and a key
+  package without `verifying_key` refuse with `PaymosError`.
+- When `/assets` lists a label twice, decimals come from the first entry, as the server resolves it.
+
+### Added
+- Blind-sign guard checks the transferred token against the send asset's `fingerprint` (new optional
+  `Asset.fingerprint`; any fingerprint published under the label counts, from entries with the first
+  entry's decimals). No fingerprint → refused.
+- `Wallet(..., pinned_fingerprints={label: fingerprint | [fingerprints]})` — out-of-band pins that
+  replace the published fingerprints for those labels. A malformed pin raises `PaymosError` at
+  construction.
+- `swap` / `quote_swap` send `"mode": "exact_in"` explicitly.
+
+### Corrected
+- 0.1.2 below says the guard restores a "compromised server cannot redirect funds" guarantee. It
+  does not: the transfer's recipient is chosen by the server and is not checked, and for `exact_out`
+  the approved debit is server-computed unless `max_debit` is passed.
+
 ## 0.1.4 (2026-07-09)
 
 ### Docs

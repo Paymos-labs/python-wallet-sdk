@@ -21,17 +21,21 @@ quote send/debit/receive/fees) are raw integer strings. Never a float.
 
 Before any signature, :meth:`swap` / :meth:`withdraw` run :meth:`_verify_quote_echo`:
 the server-returned quote MUST echo the exact assets + amount the caller approved, or
-nothing is signed. That guard turns any contract drift or a lying server into a clean
-refusal instead of a wrong-amount payout.
+nothing is signed. That turns contract drift or a quote that disagrees with the request
+into a clean refusal. It checks assets and amounts only: the destination is chosen by the
+server and is not checked, and an ``exact_out`` debit is server-computed unless the caller
+caps it with ``max_debit``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import time
-from typing import Any
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from . import _frost
@@ -50,17 +54,57 @@ _TERMINAL_STATUSES = frozenset({"completed", "failed", "refunded", "expired", "c
 # converge on it rather than trying to sign a second time.
 _PROGRESSED_STATUSES = frozenset({"processing", "completed", "refunded"})
 
+# A disclosed per-source transfer amount: raw, unsigned, ASCII digits only (re's \d would admit
+# any Unicode digit, and ``$`` a trailing newline — hence the explicit class and ``fullmatch``).
+_RAW_AMOUNT = re.compile(r"[0-9]+")
+
 _DEFAULT_BASE_URL = "https://wallet.paymos.io"
 _ENV_SECRET = "PAYMOS_VAULT_SECRET"
 _ENV_BASE_URL = "PAYMOS_BASE_URL"
+
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+
+
+def _normalize_pins(pins: Mapping[str, str | Iterable[str]] | None) -> dict[str, frozenset[str]]:
+    """``pinned_fingerprints`` as ``{label: {lowercase hex sha256, ...}}``. A malformed pin is a
+    configuration error and fails at construction with :class:`PaymosError` — never silently at
+    the first payout."""
+    out: dict[str, frozenset[str]] = {}
+    for label, value in (pins or {}).items():
+        try:
+            values = [value] if isinstance(value, str) else list(value)
+        except TypeError:
+            values = []  # not a string, not iterable: malformed, reported below
+        if not values or not all(isinstance(v, str) for v in values):
+            values = []  # nothing, or a non-string among the pins: malformed, reported below
+        norm = frozenset(v.strip().lower() for v in values)
+        if not norm or not all(_FINGERPRINT.fullmatch(v) for v in norm):
+            raise PaymosError(
+                f"pinned_fingerprints[{label!r}] must be one or more 64-char hex sha256 fingerprints"
+            )
+        out[label] = norm
+    return out
 
 
 class Wallet:
     """A handle to one vault, bound to the key inside its ``vs_live_`` secret."""
 
-    def __init__(self, secret: str, base_url: str = _DEFAULT_BASE_URL, *, timeout: Any = None) -> None:
+    def __init__(
+        self,
+        secret: str,
+        base_url: str = _DEFAULT_BASE_URL,
+        *,
+        timeout: Any = None,
+        pinned_fingerprints: Mapping[str, str | Iterable[str]] | None = None,
+    ) -> None:
+        """``pinned_fingerprints`` maps an asset label (``"USDC@base"``) to the fingerprint — or
+        several — you obtained out of band (lowercase hex sha256 of the raw token id). A pinned
+        label is checked ONLY against its pins, whatever ``/assets`` publishes; unpinned labels use
+        the published catalog. It gives the co-sign's token check a trust anchor independent of
+        the server that also builds the messages being signed."""
         self._secret = VaultSecret.parse(secret)
         self._http = Http(base_url, self._secret.api_key, timeout=timeout)
+        self._pins = _normalize_pins(pinned_fingerprints)
         # Catalog cache: the Asset list + an {asset_id: decimals} map, loaded once.
         self._assets: list[Asset] | None = None
         self._decimals_by_asset: dict[str, int] = {}
@@ -71,7 +115,13 @@ class Wallet:
         return f"Wallet(vault_id={self._secret.vault_id}, has_share={self._secret.has_share}, base_url={self._http._base_url!r})"
 
     @classmethod
-    def from_env(cls, base_url: str | None = None, *, timeout: Any = None) -> "Wallet":
+    def from_env(
+        cls,
+        base_url: str | None = None,
+        *,
+        timeout: Any = None,
+        pinned_fingerprints: Mapping[str, str | Iterable[str]] | None = None,
+    ) -> "Wallet":
         """Build a wallet from the environment.
 
         Reads the vault secret from ``PAYMOS_VAULT_SECRET`` (required — raises
@@ -82,7 +132,7 @@ class Wallet:
         if not secret:
             raise PaymosError(f"{_ENV_SECRET} is not set")
         base_url = base_url or os.environ.get(_ENV_BASE_URL) or _DEFAULT_BASE_URL
-        return cls(secret, base_url, timeout=timeout)
+        return cls(secret, base_url, timeout=timeout, pinned_fingerprints=pinned_fingerprints)
 
     async def __aenter__(self) -> "Wallet":
         return self
@@ -98,10 +148,16 @@ class Wallet:
         Fetched once and cached; the decimals map is populated from the same call
         so an amount conversion never guesses or refetches."""
         if self._assets is None:
-            raw = await self._http.get("/vault/v1/assets")
+            raw = _bare_array(await self._http.get("/vault/v1/assets"), "/assets")
             assets = [Asset.from_dict(a) for a in raw]
             self._assets = assets
-            self._decimals_by_asset = {a.asset: a.decimals for a in assets}
+            # One label can appear more than once (two contracts of one coin); the server resolves a
+            # label to its FIRST catalog entry, so the decimals must come from the first one too — a
+            # dict comprehension would keep the last.
+            decimals: dict[str, int] = {}
+            for a in assets:
+                decimals.setdefault(a.asset, a.decimals)
+            self._decimals_by_asset = decimals
         return self._assets
 
     async def _decimals(self, asset_id: str) -> int:
@@ -113,6 +169,24 @@ class Wallet:
             return self._decimals_by_asset[asset_id]
         except KeyError:
             raise PaymosError(f"unknown asset {asset_id}") from None
+
+    async def _fingerprints(self, asset_id: str) -> frozenset[str]:
+        """Every fingerprint a disclosed token of ``asset_id`` may hash to.
+
+        A pinned label answers with its pins alone (the integrator vouches for them). Otherwise:
+        the fingerprints ``/assets`` publishes under the label — the catalog can list one label
+        twice (two contracts of one coin) — but only from entries whose ``decimals`` equal the
+        FIRST entry's. The debit the guard bounds amounts by is in the first entry's units; a token
+        with other decimals would compare raw units worth 10^Δ more against it. Empty when the
+        server publishes none; the guard refuses on empty."""
+        if asset_id in self._pins:
+            return self._pins[asset_id]
+        decimals = await self._decimals(asset_id)  # the first entry's, as the server resolves it
+        return frozenset(
+            a.fingerprint.lower()
+            for a in await self.assets()
+            if a.asset == asset_id and a.fingerprint and a.decimals == decimals
+        )
 
     async def _validate_amount(self, amount: str, asset: str) -> int:
         """Validate a HUMAN decimal ``amount`` against ``asset``'s decimals WITHOUT
@@ -131,7 +205,7 @@ class Wallet:
 
     async def balances(self) -> list[Balance]:
         """The caller's per-asset vault balances (raw amounts + nullable USD)."""
-        raw = await self._http.get("/vault/v1/balances")
+        raw = _bare_array(await self._http.get("/vault/v1/balances"), "/balances")
         return [Balance.from_dict(b) for b in raw]
 
     # --- quotes --------------------------------------------------------------
@@ -174,6 +248,7 @@ class Wallet:
             "send": send,
             "receive": receive,
             "amount": amount,
+            "mode": "exact_in",  # the only swap mode; sent explicitly, as the recorded request does
             "slippage_bps": slippage_bps,
         }
         return await self._quote("/vault/v1/quote/swap", body, dry=True)
@@ -238,6 +313,7 @@ class Wallet:
             "send": send,
             "receive": receive,
             "amount": amount,
+            "mode": "exact_in",  # the only swap mode; sent explicitly, as the recorded request does
             "slippage_bps": slippage_bps,
         }
         q = await self._quote(
@@ -314,11 +390,13 @@ class Wallet:
         expect_receive_raw: int | None = None,
         max_debit_raw: int | None = None,
     ) -> None:
-        """Refuse to sign unless the server's quote echoes exactly what the caller
-        approved. This is the client-side guard that makes co-signing a server-built
-        movement safe: a decimals/units bug, contract drift, or a lying/compromised
-        server that inflates the amount is caught here and raises :class:`PaymosError`
-        BEFORE any FROST commitment — so a wrong amount is never signed."""
+        """Refuse to sign unless the server's quote echoes the assets and the amount the
+        caller approved. A decimals/units bug, contract drift, or a quote whose assets or
+        pinned amount differ from the request raises :class:`PaymosError` BEFORE any FROST
+        commitment. What it pins: ``send.amount`` for a swap, ``receive.amount`` for an
+        ``exact_out`` withdraw, a debit ceiling for ``total_in``. The ``exact_out`` debit itself
+        is server-computed and only bounded by ``max_debit`` when the caller passes one; the
+        destination address is not part of the quote and is not checked here."""
         if quote.send.asset != send_asset or quote.receive.asset != receive_asset:
             raise PaymosError(
                 f"quote asset mismatch: approved {send_asset}->{receive_asset}, "
@@ -379,6 +457,8 @@ class Wallet:
             raise PaymosError("quote is missing its source count — cannot co-sign")
 
         kp = self._client_key_package()
+        # Every source of a movement moves the SEND asset; the guard holds each disclosed token to it.
+        send_fingerprints = await self._fingerprints(quote.send.asset)
 
         commitments: list[dict[str, Any]] = []
         nonces: list[dict[str, Any]] = []
@@ -396,8 +476,11 @@ class Wallet:
             if mv.status in _PROGRESSED_STATUSES:
                 return  # already signed/relayed by a prior attempt — not a double-sign
             raise
-        token = begin["token"]
-        packages = begin["signing_packages"]
+        try:
+            token = begin["token"]
+            packages = list(begin["signing_packages"])
+        except (KeyError, TypeError) as e:
+            raise PaymosError(f"co-sign refused: malformed sign/begin response: {e!r}") from e
 
         # The server must return exactly one signing package per source we committed
         # to. A count mismatch means we'd silently under-/over-sign against nonces we
@@ -407,11 +490,12 @@ class Wallet:
                 f"co-sign protocol mismatch: expected {n} signing packages, got {len(packages)}"
             )
 
-        # BLIND-SIGN GUARD — never sign a server-chosen message we cannot verify. The server
-        # discloses each source's plaintext message; we recompute its digest, confirm the
-        # package we are about to sign binds to EXACTLY that message, and check it transfers FROM our
-        # own vault for no MORE than the approved debit. Any mismatch raises and signs nothing.
-        self._verify_signing_disclosure(quote, packages, begin.get("messages"), kp)
+        # BLIND-SIGN GUARD — the server discloses each source's plaintext message; we recompute its
+        # digest, confirm the package we are about to sign binds to EXACTLY that message, and check
+        # it is one transfer FROM our own vault, of the send asset, for no MORE than the approved
+        # debit. The transfer's recipient is server-chosen and not checked. Any mismatch raises and
+        # signs nothing.
+        self._verify_signing_disclosure(quote, packages, begin.get("messages"), kp, send_fingerprints)
 
         shares = [
             _frost.sign(packages[i], nonces[i], kp) for i in range(len(packages))
@@ -436,6 +520,7 @@ class Wallet:
         packages: list[Any],
         messages: Any,
         kp: dict[str, Any],
+        send_fingerprints: frozenset[str],
     ) -> None:
         """Refuse to blind-sign a server-chosen message (audit #5).
 
@@ -443,15 +528,40 @@ class Wallet:
         (1) recompute the digest and confirm the signing package's embedded ``message`` equals
         it — the server cannot disclose one message and sign another; (2) confirm the message is a
         single ``transfer`` intent whose ``signer_id`` is THIS vault's group key — never sign from
-        another vault; and (3) confirm the sources together move no MORE than the quote's approved
-        debit — the server cannot inflate the amount. Any mismatch raises :class:`PaymosError` and the
-        co-sign aborts before a single share is produced."""
+        another vault, moving exactly one token whose id hashes to one of ``send_fingerprints``;
+        and (3) confirm the sources together move no MORE than the quote's approved debit. Any
+        mismatch raises :class:`PaymosError` and the co-sign aborts before a single share is
+        produced.
+
+        Limits. (3) bounds the transfer by the APPROVED debit, and for ``exact_out`` that debit is
+        itself server-computed unless the caller passed ``max_debit`` — so for unattended payouts
+        pass ``max_debit``. The transfer's recipient (``receiver_id``, the route's deposit address)
+        is chosen by the server and is NOT checked: a compromised server could direct the approved
+        amount elsewhere.
+
+        What (2)'s token check proves depends on where the fingerprints came from. From ``/assets``
+        they come from the same server that builds the messages: the check catches a server bug or
+        a compromised signing path, NOT a fully compromised server, which could publish a false
+        fingerprint along with a false message. Pinned via ``pinned_fingerprints`` they are a trust
+        anchor the server does not control."""
         if not isinstance(messages, list) or len(messages) != len(packages):
             raise PaymosError(
                 "co-sign refused: the server did not disclose the signing messages — "
                 "refusing to blind-sign (needs a current server)"
             )
+        # Without the vault's own group key there is nothing to hold ``signer_id`` against, and an
+        # unchecked signer is exactly "sign from another vault". Every key package the core's DKG
+        # produces carries it; one that does not is refused rather than trusted.
         expected_signer = str(kp.get("verifying_key") or "").lower()
+        if not expected_signer:
+            raise PaymosError("co-sign refused: the vault key package has no verifying key to check the signer against")
+        # Without a fingerprint for the send asset the token check below has nothing to compare
+        # with. Skipping it would re-open "approve USDC, sign away something else" — refuse instead.
+        if not send_fingerprints:
+            raise PaymosError(
+                "co-sign refused: the server did not publish an asset fingerprint — update the server"
+            )
+        want_fingerprints = frozenset(f.lower() for f in send_fingerprints)
         total = 0
         for i, (pkg, disc) in enumerate(zip(packages, messages)):
             try:
@@ -462,7 +572,12 @@ class Wallet:
                 raise PaymosError(f"co-sign refused: malformed disclosure for source {i}: {e}") from e
 
             # (1) binding: the package we are about to sign hashes to EXACTLY the disclosed message.
-            want = _digest.payload_digest_hex(message, nonce, recipient)
+            # The digest rejects a nonce that isn't 32 bytes with a ValueError; that is a malformed
+            # disclosure too, and must refuse as a PaymosError like every other one.
+            try:
+                want = _digest.payload_digest_hex(message, nonce, recipient)
+            except (TypeError, ValueError) as e:
+                raise PaymosError(f"co-sign refused: malformed disclosure for source {i}: {e}") from e
             got = pkg.get("message") if isinstance(pkg, dict) else None
             if not isinstance(got, str) or got.lower() != want:
                 raise PaymosError(
@@ -480,14 +595,26 @@ class Wallet:
                 raise PaymosError(f"co-sign refused: unreadable message for source {i}: {e}") from e
             if len(intents) != 1 or one.get("intent") != "transfer":
                 raise PaymosError(f"co-sign refused: source {i} is not a single transfer intent")
-            if expected_signer and signer_id != expected_signer:
+            if signer_id != expected_signer:
                 raise PaymosError(f"co-sign refused: source {i} signs from a different vault")
             if not isinstance(tokens, dict) or len(tokens) != 1:
                 raise PaymosError(f"co-sign refused: source {i} does not transfer exactly one token")
-            try:
-                total += int(next(iter(tokens.values())))
-            except (ValueError, StopIteration) as e:
-                raise PaymosError(f"co-sign refused: bad transfer amount for source {i}: {e}") from e
+            token_id, amount = next(iter(tokens.items()))
+            # The token moved must be the send asset: sha256(utf-8 token id) is one of its fingerprints.
+            if (not isinstance(token_id, str)
+                    or hashlib.sha256(token_id.encode("utf-8")).hexdigest() not in want_fingerprints):
+                raise PaymosError(
+                    f"co-sign refused: source {i} moves a token that is not the approved send asset "
+                    f"{quote.send.asset}"
+                )
+            # Each source's amount must be a positive ASCII-digit string — exactly what the server
+            # builds. ``int()`` alone accepts "-900", "+5", " 5", "1_000" and non-ASCII digits: a
+            # negative source B = -D would let source A move 2D while the SUM still passes (3).
+            if not isinstance(amount, str) or not _RAW_AMOUNT.fullmatch(amount) or int(amount) == 0:
+                raise PaymosError(
+                    f"co-sign refused: source {i} transfer amount {amount!r} is not a positive integer string"
+                )
+            total += int(amount)
 
         # (3) no inflation: the sources together move no more than the approved debit.
         try:
@@ -539,6 +666,15 @@ class Wallet:
     async def aclose(self) -> None:
         """Release the underlying HTTP client."""
         await self._http.aclose()
+
+
+def _bare_array(data: Any, endpoint: str) -> list[Any]:
+    """``/assets`` and ``/balances`` answer a bare JSON array (sdk/contract/fixtures). Anything
+    else is a contract fault: iterating an object would walk its KEYS and fail somewhere far
+    from the cause, and seven SDKs once read ``{"assets": [...]}`` from here — refuse loudly."""
+    if not isinstance(data, list):
+        raise PaymosError(f"{endpoint} answered {type(data).__name__}, expected a JSON array")
+    return data
 
 
 def _require_movement_id(quote: Quote) -> str:

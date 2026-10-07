@@ -11,7 +11,10 @@ rewrites them, and it never logs or echoes request bodies.
 
 Transport-level failures (connect/read timeout, DNS, reset) are wrapped into a typed
 :class:`~paymos.errors.PaymosError` (``status=None``) so a caller on the money path never
-sees a raw ``httpx`` exception. The read timeout is generous by default because the
+sees a raw ``httpx`` exception. So is a body that is not JSON at all — on ANY status: when
+the landing site owned ``wallet.paymos.io`` it answered ``/vault/v1/*`` with its own HTML
+page, which surfaced as a raw ``JSONDecodeError`` on a 2xx and as a multi-kilobyte HTML
+"message" on a 404. The read timeout is generous by default because the
 co-sign is a multi-round exchange that can outlast httpx's 5s default.
 
 The client is created lazily; tests override it by assigning ``self._client`` a client
@@ -30,19 +33,54 @@ from . import errors
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
 
+# How much of an unexpected body an error message quotes. Enough to recognize a proxy page or
+# a stack trace, short enough that a whole HTML document never becomes an exception message.
+_SNIPPET_CHARS = 200
+
+_NOT_JSON = object()  # sentinel: the body did not parse as JSON (distinct from a JSON ``null``)
+
+
+def _snippet(resp: httpx.Response) -> str:
+    """The start of the body, whitespace collapsed and truncated to ``_SNIPPET_CHARS``."""
+    text = " ".join((resp.text or "").split())
+    return text if len(text) <= _SNIPPET_CHARS else text[:_SNIPPET_CHARS] + "…"
+
+
+def _not_json_message(resp: httpx.Response) -> str:
+    """Describe a body that is not JSON. The Vault API answers JSON on every status, so this
+    is almost always something in front of it (a proxy, a CDN, the wrong ``base_url``)."""
+    ctype = resp.headers.get("content-type", "").split(";")[0].strip() or "no content-type"
+    msg = (
+        f"unexpected non-JSON response (HTTP {resp.status_code}, {ctype}) — "
+        f"check that base_url points at the Paymos wallet API"
+    )
+    snippet = _snippet(resp)
+    return f"{msg}: {snippet}" if snippet else msg
+
+
+def _json(resp: httpx.Response) -> Any:
+    """The parsed body, or ``_NOT_JSON``. Never raises."""
+    try:
+        return resp.json()
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueErrors
+        return _NOT_JSON
+
+
 def _message(body: Any, resp: httpx.Response) -> str:
     """Pull the client-safe message out of the response.
 
     Prefers ``error`` (the real key on both ``ApiError`` and ``SignResultDto``), then a
-    defensive ``detail`` fallback (this server never sends it). If the body isn't a JSON
-    object with either key, fall back to the raw response text — still client-safe.
+    defensive ``detail`` fallback (this server never sends it). A body that isn't JSON gets
+    a message naming the status and content type; JSON without either key falls back to a
+    truncated copy of the body — still client-safe.
     """
+    if body is _NOT_JSON:
+        return _not_json_message(resp)
     if isinstance(body, Mapping):
         msg = body.get("error") or body.get("detail")
         if isinstance(msg, str) and msg:
             return msg
-    text = (resp.text or "").strip()
-    return text or f"request failed with status {resp.status_code}"
+    return _snippet(resp) or f"request failed with status {resp.status_code}"
 
 
 def _classify_400(message: str) -> type[errors.PaymosError]:
@@ -66,11 +104,7 @@ def _classify_400(message: str) -> type[errors.PaymosError]:
 
 def _raise_for(resp: httpx.Response) -> None:
     """Raise the typed error mapped from a non-2xx response. Never returns."""
-    try:
-        body: Any = resp.json()
-    except Exception:
-        body = None
-    message = _message(body, resp)
+    message = _message(_json(resp), resp)
     status = resp.status_code
 
     if status == 401:
@@ -119,7 +153,12 @@ class Http:
     @staticmethod
     def _ok(resp: httpx.Response) -> Any:
         if 200 <= resp.status_code < 300:
-            return resp.json()
+            body = _json(resp)
+            if body is _NOT_JSON:
+                # A 2xx that isn't JSON did not come from the Vault API (a proxy's 200 page,
+                # an SPA fallback). Typed, never a raw JSONDecodeError.
+                raise errors.PaymosError(_not_json_message(resp), resp.status_code)
+            return body
         _raise_for(resp)  # raises
 
     async def get(self, path: str, params: Mapping[str, Any] | None = None) -> Any:

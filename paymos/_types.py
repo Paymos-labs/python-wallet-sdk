@@ -33,20 +33,29 @@ def _s(v: Any) -> str | None:
 @dataclass(frozen=True)
 class Asset:
     """A catalog entry: the white-label ``SYMBOL@chain`` id, its symbol, chain, and
-    on-chain decimals (used to convert human amounts to raw)."""
+    on-chain decimals (used to convert human amounts to raw).
+
+    ``fingerprint`` is the lowercase hex SHA-256 of the asset's raw on-chain token id. The
+    co-sign guard holds every disclosed transfer's token against it (or against the value pinned
+    in ``Wallet(pinned_fingerprints=...)``, which takes precedence). Published by the same server
+    that builds the messages, it catches a server bug, not a server that lies about both. ``None``
+    from a server too old to publish it — reads still work, but co-signing is refused."""
 
     asset: str
     symbol: str
     chain: str
     decimals: int
+    fingerprint: str | None = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "Asset":
+        fp = d.get("fingerprint")
         return cls(
             asset=d["asset"],
             symbol=d["symbol"],
             chain=d["chain"],
             decimals=int(d["decimals"]),
+            fingerprint=str(fp).lower() if fp else None,
         )
 
 
