@@ -65,6 +65,49 @@ _ENV_BASE_URL = "PAYMOS_BASE_URL"
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 
 
+def _idempotency_key(key: str | None) -> str:
+    """The key a money call is sent under: the caller's, or a fresh one when they passed none.
+
+    An empty or blank key is refused. Substituted with a fresh key — what ``key or uuid4().hex``
+    did — it gives a retry a different key, so the retry pays again; sent as is, the server reads it
+    as no key at all. Either way the caller who passed it meant to have deduplication and had none."""
+    if key is None:
+        return uuid4().hex
+    if not isinstance(key, str) or not key.strip():
+        raise PaymosError(
+            "idempotency_key is empty or not a string — pass a durable key (a payout or job id) so "
+            "a retry replays the same movement, or omit it for a fresh one per call"
+        )
+    return key
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that refuses an object repeating a key.
+
+    ``json.loads`` keeps the LAST of a repeated key. The blind-sign guard approves a message whose
+    exact bytes the on-chain verifier parses again, with a reader that rejects a repeated field, so a
+    message naming one key twice says two things — no message the server builds does that, and one
+    that does is refused rather than read one way. (Case is not the issue here: ``json`` keeps
+    ``"intents"`` and ``"Intents"`` as two keys and the guard reads the exact one, as the verifier
+    does.)"""
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _no_constant(name: str) -> Any:
+    """``parse_constant`` that refuses ``NaN`` / ``Infinity`` — Python extensions, not JSON."""
+    raise ValueError(f"not JSON: {name}")
+
+
+def _parse_strict(text: str) -> Any:
+    """``json.loads`` the way a strict reader takes it: no repeated keys, no non-JSON constants."""
+    return json.loads(text, object_pairs_hook=_unique_keys, parse_constant=_no_constant)
+
+
 def _normalize_pins(pins: Mapping[str, str | Iterable[str]] | None) -> dict[str, frozenset[str]]:
     """``pinned_fingerprints`` as ``{label: {lowercase hex sha256, ...}}``. A malformed pin is a
     configuration error and fails at construction with :class:`PaymosError` — never silently at
@@ -305,8 +348,10 @@ class Wallet:
 
         Pass your own ``idempotency_key`` (e.g. a durable job id) to make a retry after
         an ambiguous failure replay the SAME movement instead of paying twice; omitted,
-        a fresh key is generated per call. Requires a full-scope secret."""
+        a fresh key is generated per call, and a retry is a new payment. An empty or blank
+        key raises :class:`PaymosError`. Requires a full-scope secret."""
         self._require_share("swap")
+        idem = _idempotency_key(idempotency_key)
         send_dec = await self._validate_amount(amount, send)
         recv_dec = await self._decimals(receive)  # validates the receive asset is known
         body = {
@@ -316,9 +361,7 @@ class Wallet:
             "mode": "exact_in",  # the only swap mode; sent explicitly, as the recorded request does
             "slippage_bps": slippage_bps,
         }
-        q = await self._quote(
-            "/vault/v1/quote/swap", body, dry=False, idempotency_key=idempotency_key or uuid4().hex
-        )
+        q = await self._quote("/vault/v1/quote/swap", body, dry=False, idempotency_key=idem)
         if min_receive is not None:
             floor = int(parse_units(min_receive, recv_dec))
             if int(q.receive.min) < floor:
@@ -355,9 +398,11 @@ class Wallet:
         ``max_debit`` (human decimal in ``asset``) caps the total vault debit: if the quote's debit
         exceeds it, this raises and signs nothing — strongly recommended for unattended ``exact_out``
         payouts, whose input side is server-computed. Pass your own ``idempotency_key`` (e.g. your
-        payout id) to make a retry replay the SAME movement instead of paying twice. Requires a
-        full-scope secret."""
+        payout id) to make a retry replay the SAME movement instead of paying twice; omitted, a
+        fresh key is generated per call, and a retry is a new payment. An empty or blank key raises
+        :class:`PaymosError`. Requires a full-scope secret."""
         self._require_share("withdraw")
+        idem = _idempotency_key(idempotency_key)
         dec = await self._validate_amount(amount, asset)
         body = {
             "asset": asset,
@@ -365,9 +410,7 @@ class Wallet:
             "to": to,
             "mode": mode,
         }
-        q = await self._quote(
-            "/vault/v1/quote/withdraw", body, dry=False, idempotency_key=idempotency_key or uuid4().hex
-        )
+        q = await self._quote("/vault/v1/quote/withdraw", body, dry=False, idempotency_key=idem)
         # Safety gate: a withdraw is same-asset. For exact_out the approved `amount` is the guaranteed
         # OUT; for total_in it is the total DEBIT — verify the debit leg (the server returns send =
         # total - fees, so pinning send would always false-fail), capped so it never exceeds the total.
@@ -584,14 +627,17 @@ class Wallet:
                     f"co-sign refused: signing package {i} does not bind to the disclosed message"
                 )
 
-            # (2) structure + own-vault: a single transfer intent signed FROM this vault.
+            # (2) structure + own-vault: a single transfer intent signed FROM this vault. Parsed
+            # strictly — a repeated key is refused, never resolved to its last value (_unique_keys).
+            # RecursionError too: the json scanner recurses per bracket and raises it, not a
+            # ValueError, past the interpreter's recursion limit — a deep message is still a refusal.
             try:
-                m = json.loads(message)
+                m = _parse_strict(message)
                 intents = m["intents"]
                 signer_id = str(m["signer_id"]).lower()
                 one = intents[0]
                 tokens = one["tokens"]
-            except (KeyError, IndexError, TypeError, ValueError) as e:
+            except (KeyError, IndexError, TypeError, ValueError, RecursionError) as e:
                 raise PaymosError(f"co-sign refused: unreadable message for source {i}: {e}") from e
             if len(intents) != 1 or one.get("intent") != "transfer":
                 raise PaymosError(f"co-sign refused: source {i} is not a single transfer intent")

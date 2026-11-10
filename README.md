@@ -94,7 +94,9 @@ directly — `Wallet("vs_live_…")` — or from the environment with `Wallet.fr
 
 Amounts you **pass** are human decimal strings (`"100"`, `"0.5"`) — the server owns each asset's
 decimals and scales them to raw. Amounts in **responses** (balances, quote legs, fees) come back
-as raw integer strings. **Never a float**, in either direction.
+as raw integer strings. **Never a float**, in either direction. Never pre-scale what you pass
+either: `"10000"` meant as 0.01 of a 6-decimal USDC is read as **10 000 USDC**, and since the SDK
+and the server agree on that number, no check anywhere can tell it from an intended one.
 
 ### Assets
 
@@ -342,8 +344,11 @@ sign — not the funds.
 
 ### What happens if a transfer is interrupted?
 
-Every money-moving call takes an idempotency key. Repeating a call with the same key returns the
-original operation instead of starting a second one, so a retry after a timeout cannot pay twice.
+Every money-moving call is sent under an idempotency key, and repeating a call with the **same** key
+returns the original operation instead of starting a second one. That holds only if your retry
+carries the same key: pass your own durable one (`idempotency_key=`, e.g. your payout id) and retry
+with it, and a retry after a timeout cannot pay twice. Leave it out and the SDK generates a fresh key
+per call — a retry is then a second payment. An empty key is refused rather than sent.
 
 ## The same wallet, in eight languages
 

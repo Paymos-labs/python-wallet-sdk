@@ -62,7 +62,10 @@ def _json(resp: httpx.Response) -> Any:
     """The parsed body, or ``_NOT_JSON``. Never raises."""
     try:
         return resp.json()
-    except ValueError:  # JSONDecodeError and UnicodeDecodeError are both ValueErrors
+    # JSONDecodeError and UnicodeDecodeError are both ValueErrors. A body nested past the
+    # interpreter's recursion limit raises RecursionError from the json scanner instead; it is no
+    # more the API's JSON than a page of HTML, and must not escape as an untyped error.
+    except (ValueError, RecursionError):
         return _NOT_JSON
 
 

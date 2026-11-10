@@ -131,6 +131,17 @@ async def test_non_json_body_falls_back_to_text():
     assert "upstream exploded" in str(exc.value)
 
 
+async def test_a_body_nested_past_the_recursion_limit_is_a_typed_error():
+    # json raises RecursionError, not ValueError, past the interpreter's recursion limit; on a 2xx
+    # it is still not the API's JSON, and on any status it must surface typed, not raw.
+    deep = "[" * 100_000 + "]" * 100_000
+    for status in (200, 500):
+        h = _http(lambda req, s=status: httpx.Response(s, text=deep, headers={"content-type": "application/json"}))
+        with pytest.raises(errors.PaymosError) as exc:
+            await h.get("/x")
+        assert exc.value.status == status
+
+
 async def test_error_carries_status_and_message():
     h = _http(_single(401, {"error": "invalid or missing API key"}))
     with pytest.raises(errors.AuthError) as exc:
